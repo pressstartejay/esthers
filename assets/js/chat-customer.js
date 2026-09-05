@@ -948,6 +948,21 @@ class CustomerChatSession {
 
   /* ------------------------------------------------------------ writing */
 
+  /*
+   * Open a conversation.
+   *
+   * fields.clientMessageId, when present, is a RETRY of an attempt that
+   * already minted one.
+   *
+   * THIS KEY DECIDES THE CONVERSATION'S IDENTITY, not just the message's.
+   * startConversationId() in service.js is
+   * sha256(domain + uid + clientMessageId), so a fresh key is a fresh
+   * conversation - which is exactly what peekStart() exists to prevent. A
+   * visitor whose response was lost, pressing Start again, would open a
+   * SECOND conversation and appear twice in Esther's inbox as two different
+   * enquiries. Reusing the key makes the retry land on the same document,
+   * where the server recognises it.
+   */
   async start(fields) {
     if (this.stopped || this.sending) return null;
     const input = fields || {};
@@ -955,7 +970,10 @@ class CustomerChatSession {
     callUi(this.ui, 'setNotice', null);
     callUi(this.ui, 'setBusy', true);
 
-    const clientMessageId = this.deps.newClientMessageId();
+    const clientMessageId = (input && typeof input.clientMessageId === 'string'
+      && input.clientMessageId)
+      ? input.clientMessageId
+      : this.deps.newClientMessageId();
     try {
       const payload = await apiPost(this.deps, API_START, {
         name: String(input.name == null ? '' : input.name),
@@ -973,7 +991,16 @@ class CustomerChatSession {
       if (this.closed) this.applyClosed();
       return payload;
     } catch (err) {
-      this.reportFailure(err);
+      /* The key travels with the retry, so pressing Try again re-attempts THIS
+         conversation rather than opening another one. */
+      this.reportFailure(err, {
+        start: {
+          name: input.name,
+          email: input.email,
+          message: input.message,
+          clientMessageId: clientMessageId
+        }
+      });
       return null;
     } finally {
       this.sending = false;
@@ -1106,6 +1133,12 @@ class CustomerChatSession {
     if (described.kind === 'rate_limited') {
       /* Explicitly no retry handler. The wait is the point. */
       callUi(this.ui, 'setRetry', null);
+      return;
+    }
+    if (described.kind === 'offline' && retryContext && retryContext.start) {
+      /* Same key, so this re-attempts the conversation rather than opening a
+         second one. */
+      callUi(this.ui, 'setRetry', () => this.start(retryContext.start));
       return;
     }
     if (described.kind === 'offline' && retryContext && retryContext.message) {

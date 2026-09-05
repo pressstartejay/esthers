@@ -830,11 +830,35 @@
 
 .chat__panel[data-closed="true"] .chat__form { opacity: 0.6; }
 
+/*
+ * NEW controls only.
+ *
+ * .chat__send:disabled is deliberately NOT here. It already has a rule at the
+ * top of this file (opacity .42, cursor default), that rule matches on the
+ * gate-off path every visitor sees today - the Send button is disabled
+ * whenever the composer is empty, which is most of the time - and a second
+ * rule of equal specificity further down the file would silently win and
+ * restyle it. Live chat has no business changing how the demo looks.
+ *
+ * .chat__input:disabled is safe: chat.js only ever disables the composer in
+ * live mode, so this cannot match while the gate is shut.
+ */
 .chat__input:disabled,
-.chat__send:disabled,
 .chat__start-send:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/*
+ * Make [hidden] actually hide the composer.
+ *
+ * .chat__form sets display:flex, and a class selector beats the user agent's
+ * [hidden]{display:none}. So showStartForm() setting the attribute did
+ * nothing: the start form and the composer were both on screen at once,
+ * asking the visitor for the same message twice.
+ */
+.chat__form[hidden] {
+  display: none;
 }
 
 @media (prefers-reduced-motion: reduce) {

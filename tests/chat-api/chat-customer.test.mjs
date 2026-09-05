@@ -973,6 +973,208 @@ describe('regressions', () => {
     }
   });
 
+  test('start() reuses its key on retry, so no SECOND conversation is opened',
+    async () => {
+      /*
+       * THE BUG: start() minted a fresh clientMessageId per attempt. That key
+       * decides the CONVERSATION's identity - startConversationId() in
+       * service.js is sha256(domain + uid + clientMessageId) - so a visitor
+       * whose response was lost, pressing Start again, opened a second
+       * conversation and appeared twice in Esther's inbox as two separate
+       * enquiries. peekStart() never got the chance to recognise the retry.
+       */
+      const { mod } = await load();
+      let call = 0;
+      const { ui, fetcher } = await connectedSession(mod, {
+        responder: () => {
+          call += 1;
+          if (call === 1) return new TypeError('Failed to fetch');
+          return jsonResponse(200, OK_START);
+        }
+      });
+      try {
+        await ui.startHandler({ name: 'Jo', email: 'jo@example.com', message: 'hi' });
+        assert.equal(typeof ui.retry, 'function', 'a retry is offered');
+
+        const first = JSON.parse(fetcher.seen[0].init.body);
+        await ui.retry();
+        const second = JSON.parse(fetcher.seen[1].init.body);
+
+        assert.equal(second.clientMessageId, first.clientMessageId,
+          'the retry must land on the SAME conversation, not open another');
+        assert.equal(second.name, first.name);
+        assert.equal(second.email, first.email);
+        assert.equal(second.message, first.message);
+      } finally {
+        fetcher.restore();
+      }
+    });
+
+  test('the echo id is derived from the key actually SENT', async () => {
+    /*
+     * THE GAP: nothing tied the optimistic echo id to the clientMessageId that
+     * went out on the wire. Swapping the two arguments at the deriveMessageId
+     * call site - so the echo was sha256(key + NUL + conversationId) instead of
+     * sha256(conversationId + NUL + key) - passed the whole suite. The echo
+     * would then never match the delivered document and every message the
+     * visitor sent would appear twice.
+     *
+     * This closes it end to end: capture the arguments the module actually
+     * passes, and check them against the body it actually posts.
+     */
+    const crypto = await import('node:crypto');
+    const { mod } = await load();
+    const derived = [];
+    let call = 0;
+    const { ui, fetcher } = await connectedSession(mod, {
+      responder: () => { call += 1; return jsonResponse(200, call === 1 ? OK_START : OK_SEND); },
+      deps: {
+        deriveMessageId: async (conversationId, clientMessageId) => {
+          derived.push({ conversationId, clientMessageId });
+          return crypto.createHash('sha256')
+            .update(conversationId + '\u0000' + clientMessageId)
+            .digest('hex').slice(0, 40);
+        }
+      }
+    });
+    try {
+      await ui.startHandler({ name: 'Jo', email: 'jo@example.com', message: 'hi' });
+      await ui.sendHandler({ message: 'the one that matters' });
+
+      const body = JSON.parse(fetcher.seen[1].init.body);
+      assert.equal(derived.length, 1);
+      assert.equal(derived[0].conversationId, body.conversationId,
+        'argument 1 must be the conversation id that was posted');
+      assert.equal(derived[0].clientMessageId, body.clientMessageId,
+        'argument 2 must be the idempotency key that was posted - not the '
+        + 'other way round, which would make every echo a duplicate');
+
+      /* And the rendered echo carries exactly the id the server will assign. */
+      const serverId = crypto.createHash('sha256')
+        .update(body.conversationId + '\u0000' + body.clientMessageId)
+        .digest('hex').slice(0, 40);
+      const echo = (ui.messages || []).find((m) => m.pending);
+      assert.ok(echo, 'an optimistic echo was rendered');
+      assert.equal(echo.id, serverId);
+    } finally {
+      fetcher.restore();
+    }
+  });
+
+  test('the constraints actually reach the query, not just the builders',
+    async () => {
+      /*
+       * THE GAP: the listener test asserted where()/orderBy()/limit() were
+       * CALLED. It never checked their results were passed to query(), so a
+       * query built without them - or with them dropped on the floor - passed.
+       */
+      const { mod, stub } = await load();
+      const { ui, fetcher } = await connectedSession(mod);
+      try {
+        await ui.startHandler({ name: 'Jo', email: 'jo@example.com', message: 'hi' });
+        await tick();
+
+        assert.equal(stub.calls.query.length, 1);
+        const q = stub.calls.query[0];
+        assert.equal(q.base.__collection, 'chatMessages',
+          'the query is built on the chatMessages collection');
+
+        const cs = q.constraints;
+        assert.equal(cs.length, 3, 'exactly three constraints reached query()');
+        assert.deepEqual(cs[0].__where, ['conversationId', '==', 'conv-1']);
+        assert.deepEqual(cs[1].__orderBy, ['createdAt', 'asc']);
+        assert.equal(cs[2].__limit, 200);
+
+        /* And the object handed to onSnapshot is that query. */
+        assert.equal(stub.calls.onSnapshot[0].q.__query, true);
+        assert.equal(stub.calls.onSnapshot[0].q.constraints, cs);
+      } finally {
+        fetcher.restore();
+      }
+    });
+
+  test('a 429 issues no retry on ANY timescale, not just immediately',
+    async () => {
+      /*
+       * THE GAP: the no-retry-loop tests waited only for zero-delay timers, so
+       * a setTimeout(..., 1000) automatic retry would have passed them. Real
+       * retry loops are exactly that shape.
+       *
+       * Here the clock is driven forward by two minutes of fake time with the
+       * real timer queue draining in between, so a delayed retry has every
+       * opportunity to fire.
+       */
+      const { mod } = await load();
+      let call = 0;
+      const { ui, session, fetcher } = await connectedSession(mod, {
+        responder: () => {
+          call += 1;
+          if (call === 1) return jsonResponse(200, OK_START);
+          return jsonResponse(429, { ok: false, code: 'rate_limited', retryAfter: 30 });
+        }
+      });
+      const realSetTimeout = globalThis.setTimeout;
+      const scheduled = [];
+      globalThis.setTimeout = (fn, ms, ...rest) => {
+        if (typeof ms === 'number' && ms > 0) scheduled.push({ fn, ms });
+        return realSetTimeout(fn, 0, ...rest);
+      };
+      try {
+        await ui.startHandler({ name: 'Jo', email: 'jo@example.com', message: 'hi' });
+        await tick();
+        const before = fetcher.seen.length;
+
+        await ui.sendHandler({ message: 'too fast' });
+        await tick(5);
+
+        /* Fire everything the module scheduled with a delay, as if two
+           minutes had passed. */
+        for (const t of scheduled.splice(0)) {
+          try { t.fn(); } catch (err) { /* a timer that throws is its own bug */ }
+        }
+        await tick(5);
+
+        assert.equal(fetcher.seen.length, before + 1,
+          'one attempt, and nothing rescheduled itself on any delay');
+        assert.equal(ui.retry, null);
+        assert.equal(session.sending, false);
+      } finally {
+        globalThis.setTimeout = realSetTimeout;
+        fetcher.restore();
+      }
+    });
+
+  test('the demo Send button keeps the exact style it already had', () => {
+    /*
+     * THE BUG: the new stylesheet block restyled .chat__send:disabled. The
+     * existing rule at the top of the file gives it opacity .42 and
+     * cursor:default; the new one had equal specificity and came later, so it
+     * silently won - changing the Send button on the gate-off path that every
+     * visitor sees today, because that button is disabled whenever the
+     * composer is empty.
+     */
+    const css = readFileSync('/home/user/esthers/assets/css/chat.css', 'utf8');
+    const rules = css.split('\n')
+      .map((l, i) => ({ l: l.trim(), n: i + 1 }))
+      .filter((x) => x.l.includes('.chat__send:disabled') && !x.l.startsWith('*'));
+    assert.equal(rules.length, 1,
+      '.chat__send:disabled must be styled in exactly one place, found at lines '
+      + rules.map((r) => r.n).join(', '));
+    assert.match(rules[0].l, /opacity: 0\.42/);
+    assert.match(rules[0].l, /cursor: default/);
+  });
+
+  test('[hidden] actually hides the composer', () => {
+    /*
+     * THE BUG: .chat__form sets display:flex, and a class selector beats the
+     * user agent's [hidden]{display:none}. showStartForm() set the attribute
+     * and nothing happened - the start form and the composer were on screen
+     * together, asking for the same message twice.
+     */
+    const css = readFileSync('/home/user/esthers/assets/css/chat.css', 'utf8');
+    assert.match(css, /\.chat__form\[hidden\] \{\s*display: none;/);
+  });
+
   test('the source no longer carries a literal NUL byte', () => {
     /* One did, in the test that reproduces the server hash - it made the file
        read as binary to grep and other text tooling. */

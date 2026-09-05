@@ -373,7 +373,7 @@ removes the protection App Check exists to provide.
 | `docs/CHAT_CUSTOMER_FRONTEND.md` | the customer architecture and the DevTools review walkthrough |
 | `tests/chat-api/app-check.test.mjs` | 41 tests, the server gate |
 | `tests/chat-api/app-check-client.test.mjs` | 24 tests, the browser App Check module |
-| `tests/chat-api/chat-customer.test.mjs` | 98 tests, the customer frontend |
+| `tests/chat-api/chat-customer.test.mjs` | 104 tests, the customer frontend |
 | `tests/chat-api/fixtures/firebase-sdk-stub.mjs` | stands in for the Firebase Web SDK so the client tests need no network |
 | `tests/chat-api/fixtures/firebase-sdk-full-stub.mjs` | the same, plus Auth and Firestore, for the customer flow |
 | `tests/chat-api/fixtures/source-view.mjs` | reads a module as code rather than as text, so a mention in a comment is not read as a use |

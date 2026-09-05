@@ -299,6 +299,13 @@ accepts an optional `clientMessageId` and the retry handler passes the failed
 attempt's own key back in; a test asserts the two requests carry the identical
 key, and that two *different* messages still get different ones.)
 
+**`start()` reuses its key on retry too**, and for a sharper reason: that key
+decides the *conversation's* identity, not just the message's —
+`startConversationId()` is `sha256(domain + uid + clientMessageId)`. A fresh key
+is a fresh conversation, so a visitor whose start response was lost would have
+appeared in Esther's inbox twice, as two separate enquiries. (Also a
+pre-commit review find; `send()` was fixed first and `start()` was missed.)
+
 **A conversation the server says is gone is discarded.** On `404
 conversation_not_found`, on `400 invalid_conversation_id`, and on a Firestore
 `permission-denied`, the stored id is forgotten and the start form is offered.
@@ -445,7 +452,7 @@ exactly as it is for everybody else.
 
 ## 10. What tests can and cannot prove
 
-`tests/chat-api/chat-customer.test.mjs` — 98 tests — runs both real modules
+`tests/chat-api/chat-customer.test.mjs` — 104 tests — runs both real modules
 with only the four gstatic SDK URLs swapped for a local stub, so the ordering
 and the header separation are proven against the real `chat-app-check.js`
 rather than a stand-in.
